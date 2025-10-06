@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: thanos-query
+  namespace: default
+  labels:
+    app: thanos-query
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: thanos-query
+  template:
+    metadata:
+      labels:
+        app: thanos-query
+    spec:
+      containers:
+      - name: thanos-query
+        image: quay.io/thanos/thanos:v0.39.2
+        args:
+        - query
+        - --http-address=0.0.0.0:9092
+        - --grpc-address=0.0.0.0:10901
+        - --endpoint=prometheus:10901
+        - --query.replica-label=replica
+        - --query.auto-downsampling
+        - --query.enforce-tenancy
+        ports:
+        - name: http
+          containerPort: 9092
+        - name: grpc
+          containerPort: 10901
+        volumeMounts:
+        - name: selector-config
+          mountPath: /etc/thanos
+          readOnly: true
+        livenessProbe:
+          httpGet:
+            path: /-/healthy
+            port: http
+          initialDelaySeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: http
+          initialDelaySeconds: 15
+      volumes:
+      - name: selector-config
+        configMap:
+          name: thanos-selector-relabel-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: thanos-query
+  namespace: default
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 9092
+    targetPort: http
+  - name: grpc
+    port: 10901
+    targetPort: grpc
+  selector:
+    app: thanos-query

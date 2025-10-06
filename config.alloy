@@ -1,0 +1,30 @@
+// Receive OTLP metrics over gRPC and HTTP
+otelcol.receiver.otlp "default" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+
+  output {
+    metrics = [otelcol.exporter.prometheus.default.input]
+  }
+}
+
+// Convert OTLP metrics to Prometheus format
+otelcol.exporter.prometheus "default" {
+  forward_to = [prometheus.remote_write.default.receiver]
+}
+
+// Forward to Prometheus with external labels
+prometheus.remote_write "default" {
+  external_labels = {
+    secure = "yes",
+  }
+
+  endpoint {
+    url = "http://localhost:9090/api/v1/write"
+  }
+}

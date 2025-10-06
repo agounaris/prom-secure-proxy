@@ -1,0 +1,247 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openresty-config
+  namespace: default 
+data:
+  nginx.conf: |
+    worker_processes 1;
+    error_log /dev/stderr info;
+
+    events {
+        worker_connections 1024;
+    }
+
+    http {
+        include mime.types;
+        default_type application/octet-stream;
+        
+        access_log /dev/stdout;
+        sendfile on;
+        keepalive_timeout 65;
+
+        server {
+            listen 8080;
+            server_name localhost;
+
+            location / {
+                default_type text/html;
+                content_by_lua_block {
+                    ngx.say("<p>Hello from OpenResty on Kubernetes</p>")
+                }
+            }
+
+            location /health {
+                return 200 "OK\n";
+            }
+
+            location /api/v1/query {
+                access_by_lua_block {
+                    local tenant_id = ngx.req.get_headers()["X-Scope-OrgID"]
+                    
+                    if not tenant_id then
+                        ngx.log(ngx.ERR, "Missing X-Scope-OrgID header")
+                        ngx.status = 403
+                        ngx.say("Forbidden: X-Scope-OrgID header required")
+                        return ngx.exit(403)
+                    end
+                    
+                    ngx.log(ngx.ERR, "Tenant ID: ", tenant_id)
+                    ngx.log(ngx.ERR, "Request URI: ", ngx.var.request_uri)
+                    
+                    local args = ngx.req.get_uri_args()
+                    ngx.log(ngx.ERR, "Original query parameter: ", ngx.req.get_uri_args()) 
+                    
+                    -- Handle /api/v1/query and /api/v1/query_range
+                    if args.query then
+                        local original_query = args.query
+                        ngx.log(ngx.ERR, "Original query parameter: ", original_query)
+                        
+                        local modified_query
+                        
+                        -- Check if query already has label selectors (contains {})
+                        if original_query:match("{") then
+                            -- Has existing labels: up{label1="test"}
+                            -- Insert tenant_id into the label selector
+                            modified_query = original_query:gsub("({)", '%1tenant_id="' .. tenant_id .. '",')
+                            
+                            -- Handle case where there's a closing brace immediately: up{}
+                            modified_query = modified_query:gsub('tenant_id="' .. tenant_id .. '",}', 'tenant_id="' .. tenant_id .. '"}')
+                        else
+                            -- No existing labels: just "up"
+                            -- Add tenant_id as the only label
+                            -- Handle potential whitespace or operators after metric name
+                            modified_query = original_query:gsub("([%w_:]+)", '%1{tenant_id="' .. tenant_id .. '"}', 1)
+                        end
+                        
+                        args.query = modified_query
+                        ngx.log(ngx.ERR, "Modified query parameter: ", modified_query)
+                    end
+                    
+                    -- Handle /api/v1/label/<name>/values and /api/v1/series
+                    if ngx.var.uri:match("/api/v1/label/") or ngx.var.uri:match("/api/v1/series") then
+                        ngx.log(ngx.ERR, "Processing label/series endpoint")
+                        
+                        local matches = args["match[]"]
+                        
+                        if matches then
+                            if type(matches) == "table" then
+                                for i, match in ipairs(matches) do
+                                    ngx.log(ngx.ERR, "Original match[", i, "]: ", match)
+                                    if match:match("{") then
+                                        matches[i] = match:gsub("({)", '%1tenant_id="' .. tenant_id .. '",')
+                                        matches[i] = matches[i]:gsub('tenant_id="' .. tenant_id .. '",}', 'tenant_id="' .. tenant_id .. '"}')
+                                    else
+                                        matches[i] = match .. '{tenant_id="' .. tenant_id .. '"}'
+                                    end
+                                    ngx.log(ngx.ERR, "Modified match[", i, "]: ", matches[i])
+                                end
+                            else
+                                ngx.log(ngx.ERR, "Original match[]: ", matches)
+                                if matches:match("{") then
+                                    matches = matches:gsub("({)", '%1tenant_id="' .. tenant_id .. '",')
+                                    matches = matches:gsub('tenant_id="' .. tenant_id .. '",}', 'tenant_id="' .. tenant_id .. '"}')
+                                else
+                                    matches = matches .. '{tenant_id="' .. tenant_id .. '"}'
+                                end
+                                ngx.log(ngx.ERR, "Modified match[]: ", matches)
+                            end
+                            args["match[]"] = matches
+                        else
+                            args["match[]"] = '{tenant_id="' .. tenant_id .. '"}'
+                            ngx.log(ngx.ERR, "Added match[]: {tenant_id=\"", tenant_id, "\"}")
+                        end
+                    end
+                    
+                    -- Set modified arguments - this will automatically URL encode them
+                    ngx.req.set_uri_args(args)
+                    
+                    ngx.log(ngx.ERR, "Final query string: ", ngx.var.args)
+                }
+                
+                proxy_pass http://prometheus:9090;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+            }
+
+            location /api/v1/query_range {
+                access_by_lua_block {
+                    -- Read the X-Scope-OrgID header
+                    local tenant_id = ngx.req.get_headers()["X-Scope-OrgID"]
+
+                    ngx.log(ngx.ERR, "tenant_id: ", tenant_id)
+                    
+                    if not tenant_id then
+                        ngx.log(ngx.WARN, "Missing X-Scope-OrgID header from ", ngx.var.remote_addr)
+                        ngx.status = 400
+                        ngx.say("Missing X-Scope-OrgID header")
+                        return ngx.exit(400)
+                    end
+                    
+                    -- Get existing query parameters
+                    local args = ngx.req.get_uri_args()
+                    
+                    -- Log the original query
+                    if args.query then
+                        ngx.log(ngx.ERR, "Original query: ", args.query)
+                        ngx.log(ngx.ERR, "Tenant ID: ", tenant_id)
+                        
+                        local modified_query = args.query
+                        
+                        -- Inject tenant_id label into PromQL query
+                        if modified_query:match("^[%w_:]+$") then
+                            modified_query = modified_query .. '{tenant_id="' .. tenant_id .. '"}'
+                        elseif modified_query:match("{.*}") then
+                            modified_query = modified_query:gsub("({[^}]*)", '%1,tenant_id="' .. tenant_id .. '"')
+                        else
+                            modified_query = modified_query:gsub("([%w_:]+)([{(])", 
+                                '%1{tenant_id="' .. tenant_id .. '"}%2')
+                        end
+                        
+                        args.query = modified_query
+                        
+                        -- Log the modified query
+                        ngx.log(ngx.ERR, "Modified query: ", modified_query)
+                    end
+                    
+                    -- Set modified arguments
+                    ngx.req.set_uri_args(args)
+                }
+                
+                proxy_pass http://prometheus:9090;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+            }
+        }
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openresty
+  namespace: default
+  labels:
+    app: openresty
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openresty
+  template:
+    metadata:
+      labels:
+        app: openresty
+    spec:
+      containers:
+      - name: openresty
+        image: openresty/openresty:alpine
+        ports:
+        - containerPort: 8080
+          name: http
+        volumeMounts:
+        - name: config
+          mountPath: /usr/local/openresty/nginx/conf/nginx.conf
+          subPath: nginx.conf
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+      volumes:
+      - name: config
+        configMap:
+          name: openresty-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openresty
+  namespace: default
+  labels:
+    app: openresty
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 8080
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  selector:
+    app: openresty
